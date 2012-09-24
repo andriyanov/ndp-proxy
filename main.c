@@ -1,4 +1,7 @@
-/*  Copyright (C) 2011  P.D. Buchan (pdbuchan@yahoo.com)
+/*  Copyright (C) 2012  Alexey Andriyanov (alan@al-an.info)
+
+    Based on the source by P.D. Buchan (pdbuchan@yahoo.com)
+    http://www.pdbuchan.com/rawsock/rawsock.html
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -14,23 +17,30 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Receive an IPv6 router advertisement and extract
-// various information stored in the ethernet frame.
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>           // close()
+#include <unistd.h>           // close(), getopt()
 #include <string.h>           // strcpy, memset(), and memcpy()
 
 #include <netinet/icmp6.h>
 #include <netinet/in.h>       // IPPROTO_IPV6, IPPROTO_ICMPV6
 #include <netinet/ip.h>       // IP_MAXPACKET (65535)
+#include <netinet/ip6.h>      // struct ip6_hdr
 #include <arpa/inet.h>        // inet_pton() and inet_ntop()
 #include <net/if.h>           // struct ifreq
+#include <netinet/if_ether.h> // struct ethhdr, ETH_P_IPV6
 #include <bits/socket.h>      // structs msghdr and cmsghdr
+#include <sys/ioctl.h>        // macro ioctl is defined
+#include <bits/ioctls.h>      // defines values for argument "request" of ioctl. Here, we need SIOCGIFHWADDR
+
+#include <sys/types.h>
+#include <ifaddrs.h>          // getifaddrs(), freeifaddrs()
+
+#include <pcap.h>
 
 int sd; // socket descriptor
 int ifindex;
+struct ifreq ifr;
 struct in6_addr source; // the link-local address of this machine
 
 // Taken from <linux/ipv6.h>, also in <netinet/in.h>
@@ -39,8 +49,7 @@ struct in6_pktinfo {
 	int             ipi6_ifindex;
 };
 
-	char * 
-format_ip6 (struct in6_addr *paddr)
+char * format_ip6 (struct in6_addr *paddr)
 {
 	char *ret = malloc (40);
 	inet_ntop (AF_INET6, paddr, ret, 40);
@@ -72,7 +81,7 @@ unsigned short int checksum (unsigned short int *addr, int len)
 	return (answer);
 }
 
-int send_nd_redirect (struct in6_addr *dst, struct in6_addr *target)
+int send_nd_nadvert (struct in6_addr *dst, struct in6_addr *target)
 {
 	static const int hoplimit = 255;
 	struct msghdr msghdr;
@@ -89,20 +98,26 @@ int send_nd_redirect (struct in6_addr *dst, struct in6_addr *target)
 		uint8_t dummy[3];
 		uint8_t pproto;
 
-		// ICMPv6 redirect packet
-		struct nd_redirect icmp_pkt;
+		// ICMPv6 NA packet
+		struct nd_neighbor_advert icmp_hdr;
+		struct nd_opt_hdr icmp_opt_hdr;
+		uint8_t mac_addr[IFHWADDRLEN];
 	} opkt; // TODO: __attribute__ ((packed));
+
+	int icmp_len = sizeof (struct nd_neighbor_advert) + sizeof (struct nd_opt_hdr) + IFHWADDRLEN;
 
 	memset (&opkt, 0, sizeof (opkt));
 	opkt.psrc = source;
 	opkt.pdst = *dst;
-	opkt.pupper_len = htonl (sizeof (struct nd_redirect));
-	opkt.pproto = IPPROTO_IPV6;
-	opkt.icmp_pkt.nd_rd_hdr.icmp6_type = ND_REDIRECT;
-	opkt.icmp_pkt.nd_rd_hdr.icmp6_code = 0;
-	opkt.icmp_pkt.nd_rd_target = *target;
-	opkt.icmp_pkt.nd_rd_dst = source;
-	opkt.icmp_pkt.nd_rd_hdr.icmp6_cksum = checksum ((unsigned short int *) &opkt, sizeof (opkt));
+	opkt.pupper_len = htonl (icmp_len);
+	opkt.pproto = IPPROTO_ICMPV6;
+	opkt.icmp_hdr.nd_na_type = ND_NEIGHBOR_ADVERT;
+	opkt.icmp_hdr.nd_na_code = 0;
+	opkt.icmp_hdr.nd_na_target = *target;
+	opkt.icmp_opt_hdr.nd_opt_type = ND_OPT_TARGET_LINKADDR;
+	opkt.icmp_opt_hdr.nd_opt_len = 1;
+	memcpy (&opkt.mac_addr, &ifr.ifr_addr.sa_data, IFHWADDRLEN);
+	opkt.icmp_hdr.nd_na_cksum = checksum ((unsigned short int *) &opkt, sizeof (opkt));
 
 	// prepare destination
 	memset (&destination, 0, sizeof (destination));
@@ -110,13 +125,12 @@ int send_nd_redirect (struct in6_addr *dst, struct in6_addr *target)
 	destination.sin6_family = AF_INET6;
 
 	// Prepare msghdr for sendmsg().
-
 	memset (&msghdr, 0, sizeof (msghdr));
 	msghdr.msg_name = &destination;  // Destination IPv6 address as struct sockaddr_in6
 	msghdr.msg_namelen = sizeof (destination);
 	memset (&iov, 0, sizeof (iov));
-	iov.iov_base = (unsigned char *) &opkt.icmp_pkt;  // Point msghdr to packet buffer
-	iov.iov_len = sizeof (opkt.icmp_pkt);
+	iov.iov_base = (unsigned char *) &opkt.icmp_hdr;  // Point msghdr to packet buffer
+	iov.iov_len = icmp_len;
 	msghdr.msg_iov = &iov;                 // scatter/gather array
 	msghdr.msg_iovlen = 1;                // number of elements in scatter/gather array
 
@@ -125,7 +139,7 @@ int send_nd_redirect (struct in6_addr *dst, struct in6_addr *target)
 	int cmsglen = CMSG_SPACE (sizeof (int)) + CMSG_SPACE (sizeof (struct in6_pktinfo));
 	if (NULL == (msghdr.msg_control = (unsigned char *) malloc (cmsglen * sizeof (unsigned char)))) {
 		fprintf (stderr, "ERROR: Cannot allocate memory for array 'msghdr.msg_control'.\n");
-		exit (EXIT_FAILURE);
+		return 0;
 	}
 	memset (msghdr.msg_control, 0, cmsglen);
 	msghdr.msg_controllen = cmsglen;
@@ -137,7 +151,7 @@ int send_nd_redirect (struct in6_addr *dst, struct in6_addr *target)
 	cmsghdr1->cmsg_len = CMSG_LEN (sizeof (int));
 	*((int *) CMSG_DATA (cmsghdr1)) = hoplimit;  // Copy pointer to int hoplimit
 
-	// Specify source interface index for this packet via cmsghdr data.
+	// Specify source interface index and source IP address for this packet via cmsghdr data.
 	cmsghdr2 = CMSG_NXTHDR (&msghdr, cmsghdr1);
 	cmsghdr2->cmsg_level = IPPROTO_IPV6;
 	cmsghdr2->cmsg_type = IPV6_PKTINFO;  // We want to specify interface here
@@ -156,82 +170,235 @@ int send_nd_redirect (struct in6_addr *dst, struct in6_addr *target)
 	return ret;
 }
 
+int find_link_local_ip (char *ifname, struct in6_addr * result)
+{
+	int ret = 0;
+	struct ifaddrs * list;
+	if (0 != getifaddrs (&list)) {
+		perror ("getifaddrs");
+		return 0;
+	}
+	
+	struct ifaddrs *i = list;
+	while (i) {
+		if (0 == strcmp (i->ifa_name, ifname)) {
+			if (i->ifa_addr->sa_family == AF_INET6) {
+				struct sockaddr_in6 * v6addr = (struct sockaddr_in6 *) i->ifa_addr;
+				if ( *((uint16_t *)&v6addr->sin6_addr) == 0x80fe ) {
+					*result = v6addr->sin6_addr;
+					ret = 1;
+					break;
+				}
+			}
+		}
+		i = i->ifa_next;
+	}
+	
+	freeifaddrs (list);
+	return ret;
+}
+
+void display_help (void) {
+	printf ("\
+ndp-proxy [ -h ] -i { ifname } prefix [ ... ]\n\
+  prefix is an IPv6 prefix in form `a:b:c::/32'.\n\
+  You could specify multiple prefixes.\n\
+");
+}
+
+struct prefix_list {
+	struct prefix_list *next;
+	struct in6_addr addr;
+	unsigned int mask;
+};
+
+int addr_matches_filter (struct prefix_list *filter, struct in6_addr *addr) {
+	while (filter) {
+		int i;
+		int found = 1;
+		uint32_t mask;
+		uint32_t *a = (uint32_t *) &filter->addr;
+		uint32_t *b = (uint32_t *) addr;
+		for (i = 1; i <= 4; i++) {
+			// calculate binary mask
+			if (i * 32 <= filter->mask)
+				mask = 0xFFFFFFFF;
+			else if ((i - 1) * 32 >= filter->mask)
+				mask = 0;
+			else
+				mask = htonl (0xFFFFFFFF << (32 - (filter->mask % 32)));
+
+			if ((*a & mask) != (*b & mask)) {
+				found = 0;
+				break;
+			}
+			a++; b++;
+		}
+		if (found)
+			return 1;
+		filter = filter->next;
+	}
+	return 0;
+}
+
 int main (int argc, char **argv)
 {
 	struct nd_neighbor_solicit *ns;
-	unsigned char inpack[IP_MAXPACKET];
-	struct ifreq ifr;
+	struct sockaddr_in6 src;
+	struct prefix_list * filters = NULL;
 
-	// Interface to receive packet on.
-	int iArg = 1;
-	if (iArg >= argc) {
-		fprintf (stderr, "Expecting interface name as argument\n");
-		exit (EXIT_FAILURE);
-	}
-	strncpy (ifr.ifr_name, argv[iArg++], sizeof(ifr.ifr_name)); //TODO
+	memset (&ifr, 0, sizeof (ifr));
 
-#define SRC_ADDR "fe80::b299:28ff:fec8:f036"
-	switch (inet_pton (AF_INET6, SRC_ADDR, &source))
-	{
-		case 1:
+	int opt;
+	while ((opt = getopt (argc, argv, "hi:")) != -1) {
+		int do_break = 0;
+		switch (opt) {
+			case 'h':
+				display_help();
+				return 0;
+			case 'i':
+				strncpy (ifr.ifr_name, optarg, sizeof (ifr.ifr_name) - 1);
+				break;
+			default: /* '?' */
+				do_break = 1;
+				break;
+		}
+		if (do_break)
 			break;
-		case -1:
-			perror ("inet_pton");
-			exit (EXIT_FAILURE);
-		default:
-			fprintf (stderr, "Invalid address `%s'\n", SRC_ADDR);
-			exit (EXIT_FAILURE);
-	};
+	}
 
-	// zero memory for input packet
-	memset (inpack, 0, sizeof (inpack));
+	if (*ifr.ifr_name == '\0') {
+		fprintf (stderr, "Expecting interface name as argument. Use -h to get help.\n");
+		return EXIT_FAILURE;
+	}
+	struct in6_addr v6buff;
+	unsigned int mask;
+	char addr[BUFSIZ];
+	for (; optind < argc; optind++) {
+		if (2 != sscanf (argv[optind], "%[^/]/%u", &addr, &mask)) {
+			fprintf (stderr, "Invalid IPv6 prefix `%s'\n", argv[optind]);
+			return EXIT_FAILURE;
+		}
+		if (mask > 128) {
+			fprintf (stderr, "Invalid IPv6 prefix length %d\n", mask);
+			return EXIT_FAILURE;
+		}
+		switch (inet_pton (AF_INET6, addr, &v6buff))
+		{
+			case -1:
+				perror ("inet_pton");
+				return EXIT_FAILURE;
+			case 0:
+				fprintf (stderr, "Invalid IPv6 address `%s'\n", addr);
+				return EXIT_FAILURE;
+		}
+		struct prefix_list * new_item = malloc (sizeof (struct prefix_list));
+		new_item->addr = v6buff;
+		new_item->mask = mask;
+		new_item->next = filters;
+		filters = new_item;
+	}
+	if (! filters) {
+		fprintf (stderr, "No IPv6 filter prefixes specified. Use -h to get help.\n");
+		return EXIT_FAILURE;
+	}
+	
+	if (! find_link_local_ip (ifr.ifr_name, &source)) {
+		fprintf (stderr, "Unable to obtain IPv6 link-local address on %s\n", ifr.ifr_name);
+		return EXIT_FAILURE;
+	}
 
-	// Request a socket descriptor sd.
+	// Request a raw socket descriptor sd.
 	if ((sd = socket (AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)) < 0) {
 		perror ("socket");
-		exit (EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 
-	// filter only ICMPv6 NS messages
-	struct icmp6_filter filter;
-	ICMP6_FILTER_SETBLOCKALL (&filter);
-	ICMP6_FILTER_SETPASS (ND_NEIGHBOR_SOLICIT, &filter);
-	if (setsockopt (sd, SOL_RAW, ICMP6_FILTER, (void *) &filter, sizeof (filter)) < 0) {
-		/* ICMPv6 filtering is not supported for now */
+	// Bind socket to specified interface
+	if (setsockopt (sd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof (ifr)) < 0) {
+		perror ("SO_BINDTODEVICE");
+		return EXIT_FAILURE;
 	}
 
 	// Retrieve source interface index.
 	if ((ifindex = if_nametoindex (ifr.ifr_name)) == 0) {
 		fprintf (stderr, "if_nametoindex %s: ", ifr.ifr_name);
 		perror (NULL);
-		exit (EXIT_FAILURE);
+		return EXIT_FAILURE;
 	}
 
-	// Bind socket to specified interface
-	if (setsockopt (sd, SOL_SOCKET, SO_BINDTODEVICE, (void *) &ifr, sizeof (ifr)) < 0) {
-		perror ("SO_BINDTODEVICE");
-		exit (EXIT_FAILURE);
+	// Obtain advertising node (source) MAC address.
+	if (ioctl (sd, SIOCGIFHWADDR, &ifr) < 0) {
+		perror ("ioctl() failed to get MAC address of advertising node ");
+		return (EXIT_FAILURE);
 	}
 
-	// Listen for incoming message from socket sd.
-	ns = (struct nd_neighbor_solicit *) inpack;
-	struct sockaddr_in6 src;
-	int len;
-	while (1) {
-		socklen_t src_buff = sizeof (src);
-		if ((len = recvfrom (sd, inpack, IP_MAXPACKET, 0, (struct sockaddr*) &src, &src_buff)) < 0) {
-			perror ("recvfrom failed ");
-			return (EXIT_FAILURE);
-		}
-		if (len >= sizeof(*ns) && ns->nd_ns_hdr.icmp6_type == ND_NEIGHBOR_SOLICIT) {
-			printf ("got NS from %s for %s\n", format_ip6 (&src.sin6_addr), format_ip6 (&ns->nd_ns_target));
-			if (send_nd_redirect (&src.sin6_addr, &ns->nd_ns_target))
-				printf ("sent redirect\n");
-		}
+	// open pcap handler for device
+	char errbuff[PCAP_ERRBUF_SIZE];
+	pcap_t * ph = pcap_open_live (ifr.ifr_name, IP_MAXPACKET, 1, 0, errbuff); // promisc=1, timeout=0
+	if (NULL == ph) {
+		fprintf (stderr, "pcap_open_live: %s\n", errbuff);
+		return EXIT_FAILURE;
 	}
+	
+	// filter only ICMPv6 messages
+	struct bpf_program fp;
+	const char * filter_exp = "ip6 and icmp6";
+	if (-1 == pcap_compile (ph, &fp, filter_exp, 1, 0)) {
+		fprintf(stderr, "Couldn't parse filter %s: %s\n", filter_exp, pcap_geterr (ph));
+		return EXIT_FAILURE;
+	}
+	if (pcap_setfilter (ph, &fp) == -1) {
+		fprintf (stderr, "pcap_setfilter `%s': %s\n", filter_exp, pcap_geterr (ph));
+		return EXIT_FAILURE;
+	}
+
+	const u_char * packet;		/* The actual packet */
+	struct pcap_pkthdr * header;	/* The header that pcap gives us */
+	int pcap_ret = 1;
+	while (1 == (pcap_ret = pcap_next_ex (ph, &header, &packet)))
+	{
+		int len = sizeof (struct ethhdr);
+
+		if (header->caplen < len)
+			continue;
+		struct ethhdr * hdr = (struct ethhdr *) packet;
+		if (ntohs (hdr->h_proto) != ETH_P_IPV6)
+			continue;
+		len += sizeof (struct ip6_hdr);
+		if (header->caplen < len)
+			continue;
+		struct ip6_hdr * hdr2 = (struct ip6_hdr *) (hdr + 1);
+		if (hdr2->ip6_nxt != IPPROTO_ICMPV6)
+			continue;
+		len += sizeof (struct icmp6_hdr);
+		if (header->caplen < len)
+			continue;
+		struct icmp6_hdr * hdr3 = (struct icmp6_hdr *) (hdr2 + 1);
+		if (hdr3->icmp6_type != ND_NEIGHBOR_SOLICIT)
+			continue;
+		len += sizeof (struct nd_neighbor_solicit) - sizeof (struct icmp6_hdr);
+		if (header->caplen < len)
+			continue;
+		struct nd_neighbor_solicit * ns = (struct nd_neighbor_solicit * ) hdr3;
+
+		if (addr_matches_filter (filters, &ns->nd_ns_target))
+			if (! send_nd_nadvert (&hdr2->ip6_src, &ns->nd_ns_target))
+				break;
+	}
+
+	if (pcap_ret == -1)
+		pcap_perror (ph, "pcap_next_ex");
 
 	close (sd);
+	pcap_close(ph);
+	
+	// free filters list
+	while (filters) {
+		struct prefix_list * tmp = filters;
+		filters = filters->next;
+		free (tmp);
+	}
 
 	return (EXIT_SUCCESS);
 }
-
