@@ -19,7 +19,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>           // close(), getopt()
+#include <unistd.h>           // close(), getopt(), daemon()
 #include <string.h>           // strcpy, memset(), and memcpy()
 
 #include <netinet/icmp6.h>
@@ -352,6 +352,8 @@ int main (int argc, char **argv)
 		fprintf (stderr, "pcap_setfilter `%s': %s\n", filter_exp, pcap_geterr (ph));
 		return EXIT_FAILURE;
 	}
+
+	daemon(0, 0);
 
 	const u_char * packet;		/* The actual packet */
 	struct pcap_pkthdr * header;	/* The header that pcap gives us */
