@@ -316,11 +316,7 @@ int main (int argc, char **argv)
 		new_item->next = filters;
 		filters = new_item;
 	}
-	if (! filters) {
-		fprintf (stderr, "No IPv6 filter prefixes specified. Use -h to get help.\n");
-		return EXIT_FAILURE;
-	}
-	
+
 	if (! find_link_local_ip (ifr.ifr_name, &source)) {
 		fprintf (stderr, "Unable to obtain IPv6 link-local address on %s\n", ifr.ifr_name);
 		return EXIT_FAILURE;
