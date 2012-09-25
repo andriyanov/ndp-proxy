@@ -49,13 +49,6 @@ struct in6_pktinfo {
 	int             ipi6_ifindex;
 };
 
-char * format_ip6 (struct in6_addr *paddr)
-{
-	char *ret = malloc (40);
-	inet_ntop (AF_INET6, paddr, ret, 40);
-	return ret;
-}
-
 // Checksum function
 unsigned short int checksum (unsigned short int *addr, int len)
 {
@@ -138,7 +131,7 @@ int send_nd_nadvert (struct in6_addr *dst, struct in6_addr *target)
 	// Allocate some memory for our cmsghdr data.
 	int cmsglen = CMSG_SPACE (sizeof (int)) + CMSG_SPACE (sizeof (struct in6_pktinfo));
 	if (NULL == (msghdr.msg_control = (unsigned char *) malloc (cmsglen * sizeof (unsigned char)))) {
-		fprintf (stderr, "ERROR: Cannot allocate memory for array 'msghdr.msg_control'.\n");
+		fprintf (stderr, "malloc() failed\n");
 		return 0;
 	}
 	memset (msghdr.msg_control, 0, cmsglen);
@@ -184,7 +177,7 @@ int find_link_local_ip (char *ifname, struct in6_addr * result)
 		if (0 == strcmp (i->ifa_name, ifname)) {
 			if (i->ifa_addr->sa_family == AF_INET6) {
 				struct sockaddr_in6 * v6addr = (struct sockaddr_in6 *) i->ifa_addr;
-				if ( *((uint16_t *)&v6addr->sin6_addr) == 0x80fe ) {
+				if (IN6_IS_ADDR_LINKLOCAL (&v6addr->sin6_addr)) {
 					*result = v6addr->sin6_addr;
 					ret = 1;
 					break;
@@ -200,9 +193,18 @@ int find_link_local_ip (char *ifname, struct in6_addr * result)
 
 void display_help (void) {
 	printf ("\
-ndp-proxy [ -h ] -i { ifname } prefix [ ... ]\n\
-  prefix is an IPv6 prefix in form `a:b:c::/32'.\n\
-  You could specify multiple prefixes.\n\
+ndp-proxy [ OPTIONS ] -i IFACE [ PREFIX [ ... ] ]\n\
+  PREFIX      an IPv6 prefix (or multiple) limiting target ranges\n\
+  -i IFACE    interface name to listen for neighbor solicitations on\n\
+  -p PIDFILE  create the pid file\n\
+  -h          show this help message\n\
+  -v          display version info\n\
+");
+}
+
+void display_version (void) {
+	printf ("\
+ndp-proxy 0.2\n\
 ");
 }
 
@@ -246,18 +248,30 @@ int main (int argc, char **argv)
 	struct nd_neighbor_solicit *ns;
 	struct sockaddr_in6 src;
 	struct prefix_list * filters = NULL;
+	FILE *pid_file;
 
 	memset (&ifr, 0, sizeof (ifr));
 
 	int opt;
-	while ((opt = getopt (argc, argv, "hi:")) != -1) {
+	while ((opt = getopt (argc, argv, "hvi:p:")) != -1) {
 		int do_break = 0;
 		switch (opt) {
 			case 'h':
 				display_help();
-				return 0;
+				return EXIT_SUCCESS;
+			case 'v':
+				display_version();
+				return EXIT_SUCCESS;
 			case 'i':
 				strncpy (ifr.ifr_name, optarg, sizeof (ifr.ifr_name) - 1);
+				break;
+			case 'p':
+				pid_file = fopen (optarg, "w");
+				if (NULL == pid_file) {
+					fprintf (stderr, "fopen %s: ", optarg);
+					perror (NULL);
+					return EXIT_FAILURE;
+				}
 				break;
 			default: /* '?' */
 				do_break = 1;
@@ -275,7 +289,7 @@ int main (int argc, char **argv)
 	unsigned int mask;
 	char addr[BUFSIZ];
 	for (; optind < argc; optind++) {
-		if (2 != sscanf (argv[optind], "%[^/]/%u", &addr, &mask)) {
+		if (2 != sscanf (argv[optind], "%[^/]/%u", (char*)&addr, &mask)) {
 			fprintf (stderr, "Invalid IPv6 prefix `%s'\n", argv[optind]);
 			return EXIT_FAILURE;
 		}
@@ -293,6 +307,10 @@ int main (int argc, char **argv)
 				return EXIT_FAILURE;
 		}
 		struct prefix_list * new_item = malloc (sizeof (struct prefix_list));
+		if (NULL == new_item) {
+			fprintf (stderr, "malloc() failed\n");
+			return EXIT_FAILURE;
+		}
 		new_item->addr = v6buff;
 		new_item->mask = mask;
 		new_item->next = filters;
@@ -353,7 +371,14 @@ int main (int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	daemon(0, 0);
+	if (-1 == daemon(0, 0)) {
+		perror ("daemon");
+		return EXIT_FAILURE;
+	}
+	if (pid_file) {
+		fprintf (pid_file, "%d\n", getpid());
+		fclose (pid_file);
+	}
 
 	const u_char * packet;		/* The actual packet */
 	struct pcap_pkthdr * header;	/* The header that pcap gives us */
@@ -384,7 +409,7 @@ int main (int argc, char **argv)
 			continue;
 		struct nd_neighbor_solicit * ns = (struct nd_neighbor_solicit * ) hdr3;
 
-		if (addr_matches_filter (filters, &ns->nd_ns_target))
+		if (! filters || addr_matches_filter (filters, &ns->nd_ns_target))
 			if (! send_nd_nadvert (&hdr2->ip6_src, &ns->nd_ns_target))
 				break;
 	}
@@ -402,5 +427,5 @@ int main (int argc, char **argv)
 		free (tmp);
 	}
 
-	return (EXIT_SUCCESS);
+	return EXIT_FAILURE; // daemon is supposed to work inifinitely
 }
